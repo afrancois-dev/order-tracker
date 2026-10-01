@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
@@ -7,11 +8,17 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel, Field
+
+from app import telemetry
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
+
+telemetry.setup_telemetry()
+logger = logging.getLogger("order_tracker")
 
 
 def connect():
@@ -55,7 +62,7 @@ def order_detail(row):
     order = as_dict(row)
     if order["priority"] == "express":
         placed_at = datetime.fromisoformat(order["created_at"])
-        estimated_at = placed_at.replace(day=placed_at.day + 2)
+        estimated_at = placed_at + timedelta(days=2)
         order["estimated_delivery"] = estimated_at.date().isoformat()
     return order
 
@@ -77,6 +84,34 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app)
+
+
+def _route_path(request) -> str:
+    route = request.scope.get("route")
+    return getattr(route, "path", request.url.path)
+
+
+def _record_request(request, status_code: int) -> None:
+    telemetry.request_counter().add(
+        1,
+        {
+            "http.route": _route_path(request),
+            "http.method": request.method,
+            "http.status_code": status_code,
+        },
+    )
+
+
+@app.middleware("http")
+async def request_metrics(request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        _record_request(request, 500)
+        raise
+    _record_request(request, response.status_code)
+    return response
 
 
 @app.get("/")
@@ -103,7 +138,9 @@ def get_order(order_id: str):
     with connect() as db:
         row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if row is None:
+        logger.info("order lookup failed", extra={"order_id": order_id, "result": "not_found"})
         raise HTTPException(404, "Order not found")
+    logger.info("order lookup succeeded", extra={"order_id": order_id, "result": "found"})
     return order_detail(row)
 
 
